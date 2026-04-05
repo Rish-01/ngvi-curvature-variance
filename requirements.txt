@@ -1,0 +1,7 @@
+# GPU torch for pip: use cu118/cu126/cu128 to match your NVIDIA driver (https://pytorch.org/get-started/locally/).
+--extra-index-url https://download.pytorch.org/whl/cu126
+
+numpy
+torch
+PyYAML
+matplotlib
