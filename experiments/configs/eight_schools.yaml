@@ -1,0 +1,95 @@
+# experiments/configs/eight_schools.yaml
+# ─────────────────────────────────────────────────────────────────────
+# Eight Schools experiment configuration
+# D = 10: mu, log_tau, theta_1...theta_8 (CP) or eta_1...eta_8 (NCP)
+# Run both parameterizations to isolate geometry effects.
+# ─────────────────────────────────────────────────────────────────────
+
+model:
+  name: eight_schools
+  # Observed data (Rubin, 1981) -- override here to use custom data
+  y:     [28.0, 8.0, -3.0, 7.0, -1.0, 1.0, 18.0, 12.0]
+  sigma: [15.0, 10.0, 16.0, 11.0, 9.0, 11.0, 10.0, 18.0]
+
+# Run experiment for both parameterizations.
+# Each is treated as a separate sub-experiment with identical methods/budget.
+parameterizations: [centered, noncentered]
+
+variational:
+  family: mean_field
+  low_rank_dim: 3             # only used when family: low_rank_diag
+
+# ── Compute budget ────────────────────────────────────────────────────
+budget:
+  n_iters: 5000
+  log_every: 100
+
+# ── Methods ───────────────────────────────────────────────────────────
+methods:
+
+  bbvi_adam:
+    lr: 1e-3
+    n_samples: 10
+    betas: [0.9, 0.999]
+    eps_adam: 1e-8
+
+  natural_gradient:
+    lr: 1e-2
+    n_samples: 10
+    damping: 1e-4
+
+  diagonal_fisher:
+    lr: 1e-2
+    n_samples: 10
+    damping: 1e-3
+    fisher_mode: analytic
+    fisher_ema: 0.9
+
+  variance_reduced:
+    lr: 1e-3
+    n_samples: 10
+    use_antithetic: true
+    use_stl: true
+
+# ── Diagnostics ───────────────────────────────────────────────────────
+diagnostics:
+  track_grad_var: true
+  track_fisher_cond: true
+  track_elbo: true
+  track_wall_time: true
+
+# ── Ablation 1: stochasticity ─────────────────────────────────────────
+# Run on centered parameterization only (where gradient noise is worst).
+ablation_mc_samples:
+  enabled: true
+  method: bbvi_adam
+  parameterization: centered  # which param to ablate on
+  sample_counts: [1, 5, 10, 50, 100]
+  n_iters: 3000
+
+# ── Ablation 2: damping ───────────────────────────────────────────────
+# Run on both parameterizations to see if preconditioning benefit
+# disappears in NCP (already well-conditioned posterior).
+ablation_damping:
+  enabled: true
+  method: diagonal_fisher
+  parameterizations: [centered, noncentered]
+  damping_values: [1.0e-6, 1.0e-4, 1.0e-2, 1.0e-1, 1.0, 10.0, 100.0]
+  n_iters: 3000
+
+# ── Parameterization comparison (key experiment) ──────────────────────
+# Directly compares CP vs NCP for all methods under matched budgets.
+# Expected finding: NGVI advantage shrinks or vanishes in NCP.
+parameterization_comparison:
+  enabled: true
+  methods: [bbvi_adam, natural_gradient, diagonal_fisher, variance_reduced]
+  n_iters: 5000
+
+# ── Max stable learning rate sweep ───────────────────────────────────
+lr_sweep:
+  enabled: true
+  lr_grid: [1.0, 0.316, 0.1, 0.0316, 0.01, 0.00316, 0.001, 0.000316]
+  n_probe_iters: 300
+
+# ── Reproducibility ───────────────────────────────────────────────────
+seed: 42
