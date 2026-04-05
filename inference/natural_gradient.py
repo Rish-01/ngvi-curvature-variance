@@ -219,7 +219,7 @@ class NaturalGradientVI:
 
                 if track_grad_var:
                     self.grad_var_history.append(
-                        self._estimate_grad_var()
+                        self.estimate_grad_var()
                     )
 
                 print(
@@ -246,7 +246,7 @@ class NaturalGradientVI:
             "wall_time": self.wall_times,
         }
 
-    def _estimate_grad_var(self) -> float:
+    def estimate_grad_var(self) -> float:
         """
         Estimate ||Var(natural_grad)||_2 across single-sample estimates.
         """

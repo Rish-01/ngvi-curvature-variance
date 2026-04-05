@@ -61,11 +61,12 @@ class NealsFunnel:
             torch.tensor(self.v_scale * (2 * torch.pi) ** 0.5)
         )
 
-        # log p(x | v): each x_i ~ Normal(0, exp(v/2))
-        log_var = v                          # log(exp(v)) = v
+        # log p(x | v): each x_i ~ Normal(0, exp(v/2)); Var(x_i) = exp(v)
+        log_var = v
+        var_x = torch.exp(log_var).unsqueeze(-1)  # (..., 1), broadcast over x dims
         log_px = -0.5 * (self.D - 1) * log_var - 0.5 * (
-            x ** 2 / torch.exp(log_var)
-        ).sum(-1)
+            (x ** 2 / var_x).sum(-1)
+        )
         log_px -= 0.5 * (self.D - 1) * torch.log(torch.tensor(2 * torch.pi))
 
         return log_pv + log_px

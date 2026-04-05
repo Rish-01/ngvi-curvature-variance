@@ -316,7 +316,7 @@ class DiagonalFisherVI:
                     self.condition_history.append(self.condition_number())
 
                 if track_grad_var:
-                    self.grad_var_history.append(self._estimate_grad_var())
+                    self.grad_var_history.append(self.estimate_grad_var())
 
                 print(
                     f"[DiagFisherVI] iter {i:5d} | ELBO {elbo_val:+.4f}"
@@ -343,7 +343,7 @@ class DiagonalFisherVI:
             "wall_time": self.wall_times,
         }
 
-    def _estimate_grad_var(self) -> float:
+    def estimate_grad_var(self) -> float:
         """Estimate ||Var(quasi-natural grad)||_2 from single-sample estimates."""
         f_mu, f_ls = self.get_fisher_diagonal()
         per_sample = []

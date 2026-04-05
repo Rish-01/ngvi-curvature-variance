@@ -108,17 +108,17 @@ class BBVIAdam:
         elbo_samples = log_joint - log_q                       # (S,)
         return elbo_samples.mean()
 
-    def gradient_variance(self) -> float:
+    def estimate_grad_var(self) -> float:
         """
         Estimate ||Var(grad)||_2 across n_samples independent gradient estimates.
 
-        Returns the mean squared norm of the per-sample gradient deviation.
+        Returns the Frobenius norm of the empirical per-coordinate variance.
         """
-        sigma = torch.exp(self.log_sigma)
         per_sample_grads = []
 
         for _ in range(self.n_samples):
             self.optimizer.zero_grad()
+            sigma = torch.exp(self.log_sigma)
             eps = torch.randn(1, self.D)
             z = self.mu + sigma * eps
             log_joint = self.model.log_prob(z)
@@ -180,7 +180,7 @@ class BBVIAdam:
                 self.wall_times.append(time.time() - t0)
 
                 if track_grad_var:
-                    self.grad_var_history.append(self.gradient_variance())
+                    self.grad_var_history.append(self.estimate_grad_var())
 
                 print(
                     f"[BBVIAdam] iter {i:5d} | ELBO {elbo_val:+.4f}"
