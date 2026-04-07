@@ -1,0 +1,30 @@
+
+=========================================================
+  SUMMARY
+=========================================================
+
+  CENTERED
+  Method                      Final ELBO    Best ELBO
+  ------------------------- ------------ ------------
+  BBVI + Adam                   -38.6937     -35.1853
+  Natural Gradient VI           -33.5224     -33.3704
+  Diagonal-Fisher VI            -33.5231     -33.3711
+  Variance-Reduced BBVI         -35.3500     -34.5693
+
+  NON-CENTERED
+  Method                      Final ELBO    Best ELBO
+  ------------------------- ------------ ------------
+  BBVI + Adam                   -16.2016     -15.3097
+  Natural Gradient VI           -16.1692     -15.2341
+  Diagonal-Fisher VI            -16.1692     -15.2341
+  Variance-Reduced BBVI         -16.3165     -14.2975
+
+  CP vs NCP gap
+  Method                          CP      NCP      gap
+  ------------------------- -------- -------- --------
+  BBVI + Adam                 -38.69   -16.20   +22.49
+  Natural Gradient VI         -33.52   -16.17   +17.35
+  Diagonal-Fisher VI          -33.52   -16.17   +17.35
+  Variance-Reduced BBVI       -35.35   -16.32   +19.03
+
+Log saved to results/parameterization_effect.log
