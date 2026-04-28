@@ -17,11 +17,15 @@ def _coerce_method_kwargs(kwargs: dict) -> dict:
     Normalize hyperparameters so torch and numeric code see real numbers.
     """
     out = dict(kwargs)
-    for key in ("lr", "eps_adam", "damping", "fisher_ema"):
+    for key in ("lr", "eps_adam", "damping", "fisher_ema", "v_init_scale"):
         if key in out and isinstance(out[key], str):
             out[key] = float(out[key])
     if "n_samples" in out and isinstance(out["n_samples"], str):
         out["n_samples"] = int(float(out["n_samples"]))
+    if "low_rank" in out and isinstance(out["low_rank"], str):
+        out["low_rank"] = int(float(out["low_rank"]))
+    if "variational_family" in out and out["variational_family"] is not None:
+        out["variational_family"] = str(out["variational_family"])
     if "betas" in out and isinstance(out["betas"], (list, tuple)):
         seq = out["betas"]
         out["betas"] = type(seq)(

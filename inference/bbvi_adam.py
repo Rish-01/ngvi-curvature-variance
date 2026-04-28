@@ -24,6 +24,7 @@ Reference: Kingma & Welling, "Auto-Encoding Variational Bayes", ICLR 2014.
 
 import time
 import torch
+from .lrd_math import lrd_log_prob, lrd_reparameterize
 
 
 class BBVIAdam:
@@ -55,6 +56,9 @@ class BBVIAdam:
         n_samples: int = 10,
         betas: tuple = (0.9, 0.999),
         eps_adam: float = 1e-8,
+        variational_family: str = "mean_field",
+        low_rank: int = 3,
+        v_init_scale: float = 0.01,
     ):
         self.model = model
         self.D = D
@@ -63,16 +67,22 @@ class BBVIAdam:
         self.betas = betas
         self.eps_adam = eps_adam
 
-        # Variational parameters: (mu, log_sigma)
-        self.mu = torch.zeros(D, requires_grad=True)
-        self.log_sigma = torch.zeros(D, requires_grad=True)
+        self.variational_family = variational_family
+        self.low_rank = low_rank
+        if self.variational_family not in ("mean_field", "low_rank_diag"):
+            raise ValueError("variational_family must be 'mean_field' or 'low_rank_diag'.")
 
-        self.optimizer = torch.optim.Adam(
-            [self.mu, self.log_sigma],
-            lr=lr,
-            betas=betas,
-            eps=eps_adam,
-        )
+        self.mu = torch.zeros(D, requires_grad=True)
+        if self.variational_family == "mean_field":
+            self.log_sigma = torch.zeros(D, requires_grad=True)
+            self.V = None
+            params = [self.mu, self.log_sigma]
+        else:
+            self.log_s = torch.zeros(D, requires_grad=True)
+            self.V = v_init_scale * torch.randn(D, low_rank, requires_grad=True)
+            params = [self.mu, self.log_s, self.V]
+
+        self.optimizer = torch.optim.Adam(params, lr=lr, betas=betas, eps=eps_adam)
 
         # Diagnostics
         self.elbo_history = []
@@ -91,22 +101,22 @@ class BBVIAdam:
         -------
         Scalar tensor (negative ELBO for minimization).
         """
-        sigma = torch.exp(self.log_sigma)                      # (D,)
+        if self.variational_family == "mean_field":
+            sigma = torch.exp(self.log_sigma)
+            eps = torch.randn(self.n_samples, self.D)
+            z = self.mu + sigma * eps
+            log_joint = self.model.log_prob(z)
+            log_q = (
+                -0.5 * (eps ** 2).sum(-1)
+                - self.log_sigma.sum()
+                - 0.5 * self.D * torch.log(torch.tensor(2 * torch.pi))
+            )
+            return (log_joint - log_q).mean()
 
-        # Reparameterize: z = mu + sigma * eps
-        eps = torch.randn(self.n_samples, self.D)              # (S, D)
-        z = self.mu + sigma * eps                              # (S, D)
-
-        # log p(z, x)
-        log_joint = self.model.log_prob(z)                     # (S,)
-
-        # log q(z) = sum_i N(z_i; mu_i, sigma_i)
-        log_q = -0.5 * (eps ** 2).sum(-1) \
-                - self.log_sigma.sum() \
-                - 0.5 * self.D * torch.log(torch.tensor(2 * torch.pi))   # (S,)
-
-        elbo_samples = log_joint - log_q                       # (S,)
-        return elbo_samples.mean()
+        z = lrd_reparameterize(self.mu, self.log_s, self.V, self.n_samples)
+        log_joint = self.model.log_prob(z)
+        log_q = lrd_log_prob(z, self.mu, self.log_s, self.V)
+        return (log_joint - log_q).mean()
 
     def estimate_grad_var(self) -> float:
         """
@@ -118,17 +128,32 @@ class BBVIAdam:
 
         for _ in range(self.n_samples):
             self.optimizer.zero_grad()
-            sigma = torch.exp(self.log_sigma)
-            eps = torch.randn(1, self.D)
-            z = self.mu + sigma * eps
-            log_joint = self.model.log_prob(z)
-            log_q = -0.5 * (eps ** 2).sum(-1) \
-                    - self.log_sigma.sum() \
+            if self.variational_family == "mean_field":
+                sigma = torch.exp(self.log_sigma)
+                eps = torch.randn(1, self.D)
+                z = self.mu + sigma * eps
+                log_joint = self.model.log_prob(z)
+                log_q = (
+                    -0.5 * (eps ** 2).sum(-1)
+                    - self.log_sigma.sum()
                     - 0.5 * self.D * torch.log(torch.tensor(2 * torch.pi))
-            loss = -(log_joint - log_q).mean()
+                )
+                loss = -(log_joint - log_q).mean()
+            else:
+                z = lrd_reparameterize(self.mu, self.log_s, self.V, 1)
+                log_joint = self.model.log_prob(z)
+                log_q = lrd_log_prob(z, self.mu, self.log_s, self.V)
+                loss = -(log_joint - log_q).mean()
             loss.backward()
-            g = torch.cat([self.mu.grad.detach().clone(),
-                           self.log_sigma.grad.detach().clone()])
+            if self.variational_family == "mean_field":
+                g = torch.cat([self.mu.grad.detach().clone(),
+                               self.log_sigma.grad.detach().clone()])
+            else:
+                g = torch.cat([
+                    self.mu.grad.detach().flatten().clone(),
+                    self.log_s.grad.detach().flatten().clone(),
+                    self.V.grad.detach().flatten().clone(),
+                ])
             per_sample_grads.append(g)
 
         grads = torch.stack(per_sample_grads)                  # (S, 2D)
@@ -198,7 +223,12 @@ class BBVIAdam:
         """Return current variational parameters and diagnostic history."""
         return {
             "mu": self.mu.detach().clone(),
-            "sigma": torch.exp(self.log_sigma).detach().clone(),
+            "sigma": (
+                torch.exp(self.log_sigma).detach().clone()
+                if self.variational_family == "mean_field"
+                else torch.exp(self.log_s).detach().clone()
+            ),
+            "V": None if self.V is None else self.V.detach().clone(),
             "elbo": self.elbo_history,
             "grad_var": self.grad_var_history,
             "wall_time": self.wall_times,
@@ -229,12 +259,22 @@ class BBVIAdam:
 
         for lr in sorted(lr_grid, reverse=True):
             mu0 = self.mu.detach().clone()
-            ls0 = self.log_sigma.detach().clone()
+            if self.variational_family == "mean_field":
+                ls0 = self.log_sigma.detach().clone()
+            else:
+                ls0 = self.log_s.detach().clone()
+                v0 = self.V.detach().clone()
 
             probe = BBVIAdam(self.model, self.D, lr=lr,
-                             n_samples=self.n_samples)
+                             n_samples=self.n_samples,
+                             variational_family=self.variational_family,
+                             low_rank=self.low_rank)
             probe.mu.data.copy_(mu0)
-            probe.log_sigma.data.copy_(ls0)
+            if self.variational_family == "mean_field":
+                probe.log_sigma.data.copy_(ls0)
+            else:
+                probe.log_s.data.copy_(ls0)
+                probe.V.data.copy_(v0)
 
             try:
                 for _ in range(n_probe_iters):
