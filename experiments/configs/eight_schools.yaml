@@ -42,7 +42,6 @@ methods:
     lr: 1e-2
     n_samples: 10
     damping: 1e-3
-    fisher_mode: analytic
     fisher_ema: 0.9
 
   variance_reduced:
