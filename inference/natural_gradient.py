@@ -1,3 +1,4 @@
+import math
 import time
 import torch
 
@@ -8,7 +9,7 @@ class NaturalGradientVI:
     """
     Natural-gradient VI with selectable variational family:
       - mean_field: exact diagonal Fisher in (mu, log_sigma)
-      - low_rank_diag: diagonal empirical Fisher in flattened parameters
+      - low_rank_diag: empirical full Fisher in flattened parameters
     """
 
     def __init__(
@@ -22,6 +23,8 @@ class NaturalGradientVI:
         low_rank: int = 3,
         fisher_ema: float = 0.9,
         v_init_scale: float = 0.01,
+        use_antithetic: bool = False,
+        use_stl: bool = False,
     ):
         self.model = model
         self.D = D
@@ -31,6 +34,8 @@ class NaturalGradientVI:
         self.variational_family = variational_family
         self.low_rank = low_rank
         self.fisher_ema = fisher_ema
+        self.use_antithetic = use_antithetic
+        self.use_stl = use_stl
         if self.variational_family not in ("mean_field", "low_rank_diag"):
             raise ValueError("variational_family must be 'mean_field' or 'low_rank_diag'.")
 
@@ -54,19 +59,56 @@ class NaturalGradientVI:
 
     def _sample_and_logq(self, mu, scale_param, V=None, n_samples=None):
         n = self.n_samples if n_samples is None else n_samples
+        use_pairs = self.use_antithetic and n >= 2
+        n_pair = n // 2 if use_pairs else 0
         if self.variational_family == "mean_field":
             sigma = torch.exp(scale_param)
-            eps = torch.randn(n, self.D)
+            if use_pairs:
+                eps_half = torch.randn(n_pair, self.D)
+                eps = torch.cat([eps_half, -eps_half], dim=0)
+                if n % 2 == 1:
+                    eps = torch.cat([eps, torch.randn(1, self.D)], dim=0)
+                eps = eps[:n]
+            else:
+                eps = torch.randn(n, self.D)
             z = mu + sigma * eps
-            log_q = (
-                -0.5 * (eps ** 2).sum(-1)
-                - scale_param.sum()
-                - 0.5 * self.D * torch.log(torch.tensor(2 * torch.pi))
-            )
+            if self.use_stl:
+                z_q = z.detach()
+                log_two_pi_half = -0.5 * self.D * math.log(2 * math.pi)
+                log_q = (
+                    -0.5 * (((z_q - mu) / sigma) ** 2).sum(-1)
+                    - scale_param.sum()
+                    + log_two_pi_half
+                )
+            else:
+                log_q = (
+                    -0.5 * (eps**2).sum(-1)
+                    - scale_param.sum()
+                    - 0.5 * self.D * torch.log(torch.tensor(2 * torch.pi))
+                )
             return z, log_q
-        z = lrd_reparameterize(mu, scale_param, V, n)
-        log_q = lrd_log_prob(z, mu, scale_param, V)
+        if use_pairs:
+            eps1_h = torch.randn(n_pair, self.D)
+            eps2_h = torch.randn(n_pair, self.low_rank)
+            eps1 = torch.cat([eps1_h, -eps1_h], dim=0)
+            eps2 = torch.cat([eps2_h, -eps2_h], dim=0)
+            if n % 2 == 1:
+                eps1 = torch.cat([eps1, torch.randn(1, self.D)], dim=0)
+                eps2 = torch.cat([eps2, torch.randn(1, self.low_rank)], dim=0)
+            eps1 = eps1[:n]
+            eps2 = eps2[:n]
+            s = torch.exp(scale_param)
+            z = mu + s * eps1 + eps2 @ V.T
+        else:
+            z = lrd_reparameterize(mu, scale_param, V, n)
+        z_q = z.detach() if self.use_stl else z
+        log_q = lrd_log_prob(z_q, mu, scale_param, V)
         return z, log_q
+
+    def _param_size(self) -> int:
+        if self.variational_family == "mean_field":
+            return 2 * self.D
+        return 2 * self.D + self.D * self.low_rank
 
     def fisher_diagonal(self) -> torch.Tensor:
         if self.variational_family == "mean_field":
@@ -74,16 +116,25 @@ class NaturalGradientVI:
             f_mu = 1.0 / sigma_sq
             f_ls = torch.full((self.D,), 2.0)
             return torch.cat([f_mu, f_ls]) + self.damping
-        # LRD: use EMA of empirical diagonal Fisher from score/ELBO grads.
+        raise RuntimeError("fisher_diagonal() is only valid for variational_family='mean_field'.")
+
+    def fisher_matrix(self) -> torch.Tensor:
+        if self.variational_family == "mean_field":
+            return torch.diag(self.fisher_diagonal())
         if not self._ema_initialized:
-            size = 2 * self.D + self.D * self.low_rank
-            self._fish_ema = torch.ones(size)
+            p = self._param_size()
+            self._fish_ema = torch.eye(p)
             self._ema_initialized = True
-        return self._fish_ema + self.damping
+        p = self._fish_ema.shape[0]
+        eye = torch.eye(p, device=self._fish_ema.device, dtype=self._fish_ema.dtype)
+        return self._fish_ema + self.damping * eye
 
     def fisher_condition_number(self) -> float:
-        f = self.fisher_diagonal()
-        return (f.max() / f.min()).item()
+        if self.variational_family == "mean_field":
+            f = self.fisher_diagonal()
+            return (f.max() / f.min()).item()
+        F = self.fisher_matrix()
+        return torch.linalg.cond(F).item()
 
     def _flatten_params(self, mu, scale_param, V=None):
         if self.variational_family == "mean_field":
@@ -132,7 +183,8 @@ class NaturalGradientVI:
                 scale = self.log_s.clone().requires_grad_(True)
                 V = self.V.clone().requires_grad_(True)
             z, log_q = self._sample_and_logq(mu, scale, V, n_samples=1)
-            val = (self.model.log_prob(z) - log_q).mean()
+            # Fisher metric uses score of q: E[grad log q grad log q^T].
+            val = log_q.mean()
             val.backward()
             if self.variational_family == "mean_field":
                 g = self._flatten_params(mu.grad.detach(), scale.grad.detach())
@@ -140,7 +192,7 @@ class NaturalGradientVI:
                 g = self._flatten_params(mu.grad.detach(), scale.grad.detach(), V.grad.detach())
             per_sample.append(g)
         g = torch.stack(per_sample)
-        raw = g.pow(2).mean(0)
+        raw = (g.T @ g) / g.shape[0]
         if not self._ema_initialized:
             self._fish_ema = raw.clone()
             self._ema_initialized = True
@@ -152,8 +204,12 @@ class NaturalGradientVI:
         if self.variational_family == "low_rank_diag":
             self._update_empirical_fisher()
         elbo_val, grad = self.elbo_and_grad()
-        f = self.fisher_diagonal()
-        nat_grad = grad / f
+        if self.variational_family == "mean_field":
+            f = self.fisher_diagonal()
+            nat_grad = grad / f
+        else:
+            F = self.fisher_matrix()
+            nat_grad = torch.linalg.solve(F, grad)
         self._unflatten_and_set(nat_grad)
         return elbo_val
 
@@ -199,7 +255,11 @@ class NaturalGradientVI:
         return out
 
     def estimate_grad_var(self) -> float:
-        f = self.fisher_diagonal()
+        use_diag = self.variational_family == "mean_field"
+        if use_diag:
+            f = self.fisher_diagonal()
+        else:
+            F = self.fisher_matrix()
         per = []
         for _ in range(self.n_samples):
             mu = self.mu.clone().requires_grad_(True)
@@ -209,15 +269,18 @@ class NaturalGradientVI:
             else:
                 scale = self.log_s.clone().requires_grad_(True)
                 V = self.V.clone().requires_grad_(True)
-            z, log_q = self._sample_and_logq(mu, scale, V, n_samples=1)
+            z, log_q = self._sample_and_logq(mu, scale, V, n_samples=self.n_samples)
             val = (self.model.log_prob(z) - log_q).mean()
             val.backward()
             if self.variational_family == "mean_field":
                 g = self._flatten_params(mu.grad.detach(), scale.grad.detach())
             else:
                 g = self._flatten_params(mu.grad.detach(), scale.grad.detach(), V.grad.detach())
-            per.append(g / f)
-        return torch.stack(per).var(dim=0).norm().item()
+            if use_diag:
+                per.append(g / f)
+            else:
+                per.append(torch.linalg.solve(F, g))
+        return torch.stack(per).var(dim=0, unbiased=False).norm().item()
 
     def max_stable_lr(self, lr_grid: list = None, n_probe_iters: int = 200) -> float:
         if lr_grid is None:
@@ -226,6 +289,7 @@ class NaturalGradientVI:
             probe = NaturalGradientVI(
                 self.model, self.D, lr=lr, n_samples=self.n_samples, damping=self.damping,
                 variational_family=self.variational_family, low_rank=self.low_rank, fisher_ema=self.fisher_ema,
+                use_antithetic=self.use_antithetic, use_stl=self.use_stl,
             )
             probe.mu = self.mu.clone()
             if self.variational_family == "mean_field":

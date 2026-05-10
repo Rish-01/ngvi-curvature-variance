@@ -30,13 +30,14 @@ methods:
     eps_adam: 1e-8
 
   natural_gradient:
-    lr: 1e-2
-    n_samples: 10
-    damping: 1e-4
+    lr: 1e-3
+    n_samples: 40
+    damping: 1e-1
+    fisher_ema: 0.95
 
   diagonal_fisher:
     lr: 1e-2
-    n_samples: 10
+    n_samples: 20
     damping: 1e-3
     fisher_ema: 0.9
 
@@ -44,7 +45,7 @@ methods:
     # Antithetic MC only: STL changes the training surrogate vs. the ELBO we
     # evaluate, which often destabilizes Adam on Neal's funnel.
     lr: 3.0e-4
-    n_samples: 20
+    n_samples: 40
     use_antithetic: true
     use_stl: false
 

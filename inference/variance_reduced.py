@@ -52,9 +52,10 @@ class VarianceReducedBBVI(BBVIAdam):
         if self.variational_family == "mean_field":
             sigma = torch.exp(self.log_sigma)
 
-        if self.use_antithetic:
+        use_pairs = self.use_antithetic and self.n_samples >= 2
+        if use_pairs:
             n_pair = self.n_samples // 2
-            eps_half = torch.randn(max(1, n_pair), self.D)
+            eps_half = torch.randn(n_pair, self.D)
             eps = torch.cat([eps_half, -eps_half], dim=0)
             if self.n_samples % 2 == 1:
                 eps = torch.cat([eps, torch.randn(1, self.D)], dim=0)
@@ -67,11 +68,11 @@ class VarianceReducedBBVI(BBVIAdam):
             z = self.mu + sigma * eps
         else:
             # Antithetic in latent space for low-rank factor noise.
-            if self.use_antithetic:
+            if use_pairs:
                 n_pair = self.n_samples // 2
                 r = self.low_rank
-                eps1_h = torch.randn(max(1, n_pair), self.D)
-                eps2_h = torch.randn(max(1, n_pair), r)
+                eps1_h = torch.randn(n_pair, self.D)
+                eps2_h = torch.randn(n_pair, r)
                 eps1 = torch.cat([eps1_h, -eps1_h], dim=0)
                 eps2 = torch.cat([eps2_h, -eps2_h], dim=0)
                 if self.n_samples % 2 == 1:
@@ -95,14 +96,35 @@ class VarianceReducedBBVI(BBVIAdam):
             self.optimizer.zero_grad()
             if self.variational_family == "mean_field":
                 sigma = torch.exp(self.log_sigma)
-                if self.use_antithetic:
-                    eps_half = torch.randn(self.n_samples // 2, self.D)
+                use_pairs = self.use_antithetic and self.n_samples >= 2
+                if use_pairs:
+                    n_pair = self.n_samples // 2
+                    eps_half = torch.randn(n_pair, self.D)
                     eps = torch.cat([eps_half, -eps_half], dim=0)
+                    if self.n_samples % 2 == 1:
+                        eps = torch.cat([eps, torch.randn(1, self.D)], dim=0)
+                    eps = eps[: self.n_samples]
                 else:
                     eps = torch.randn(self.n_samples, self.D)
                 z = self.mu + sigma * eps
             else:
-                z = lrd_reparameterize(self.mu, self.log_s, self.V, self.n_samples)
+                use_pairs = self.use_antithetic and self.n_samples >= 2
+                if use_pairs:
+                    n_pair = self.n_samples // 2
+                    r = self.low_rank
+                    eps1_h = torch.randn(n_pair, self.D)
+                    eps2_h = torch.randn(n_pair, r)
+                    eps1 = torch.cat([eps1_h, -eps1_h], dim=0)
+                    eps2 = torch.cat([eps2_h, -eps2_h], dim=0)
+                    if self.n_samples % 2 == 1:
+                        eps1 = torch.cat([eps1, torch.randn(1, self.D)], dim=0)
+                        eps2 = torch.cat([eps2, torch.randn(1, r)], dim=0)
+                    eps1 = eps1[: self.n_samples]
+                    eps2 = eps2[: self.n_samples]
+                    s = torch.exp(self.log_s)
+                    z = self.mu + s * eps1 + eps2 @ self.V.T
+                else:
+                    z = lrd_reparameterize(self.mu, self.log_s, self.V, self.n_samples)
             log_joint = self.model.log_prob(z)
             z_q = z.detach() if self.use_stl else z
             log_q = self._log_q(z_q, sigma if self.variational_family == "mean_field" else None)
@@ -121,4 +143,4 @@ class VarianceReducedBBVI(BBVIAdam):
             per_sample_grads.append(g)
 
         grads = torch.stack(per_sample_grads)
-        return grads.var(dim=0).norm().item()
+        return grads.var(dim=0, unbiased=False).norm().item()

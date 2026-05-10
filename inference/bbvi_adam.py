@@ -79,7 +79,8 @@ class BBVIAdam:
             params = [self.mu, self.log_sigma]
         else:
             self.log_s = torch.zeros(D, requires_grad=True)
-            self.V = v_init_scale * torch.randn(D, low_rank, requires_grad=True)
+            # Create a leaf tensor for optimizer params (avoid non-leaf from scaling op).
+            self.V = (v_init_scale * torch.randn(D, low_rank)).requires_grad_()
             params = [self.mu, self.log_s, self.V]
 
         self.optimizer = torch.optim.Adam(params, lr=lr, betas=betas, eps=eps_adam)
@@ -130,7 +131,7 @@ class BBVIAdam:
             self.optimizer.zero_grad()
             if self.variational_family == "mean_field":
                 sigma = torch.exp(self.log_sigma)
-                eps = torch.randn(1, self.D)
+                eps = torch.randn(self.n_samples, self.D)
                 z = self.mu + sigma * eps
                 log_joint = self.model.log_prob(z)
                 log_q = (
@@ -157,7 +158,7 @@ class BBVIAdam:
             per_sample_grads.append(g)
 
         grads = torch.stack(per_sample_grads)                  # (S, 2D)
-        var = grads.var(dim=0)                                 # (2D,)
+        var = grads.var(dim=0, unbiased=False)                 # (2D,)
         return var.norm().item()
 
     # ------------------------------------------------------------------

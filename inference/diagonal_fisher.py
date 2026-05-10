@@ -1,3 +1,4 @@
+import math
 import time
 import torch
 
@@ -8,8 +9,9 @@ class DiagonalFisherVI:
     """
     Diagonal empirical-Fisher quasi-natural gradient VI.
 
-    Unlike NaturalGradientVI's mean-field closed-form Fisher, this class always
-    uses empirical diagonal Fisher with EMA smoothing for all supported families.
+    Uses:
+      - mean_field: closed-form diagonal Fisher (matches NGVI preconditioner)
+      - low_rank_diag: empirical diagonal Fisher with EMA smoothing
     """
 
     def __init__(
@@ -23,6 +25,8 @@ class DiagonalFisherVI:
         variational_family: str = "mean_field",
         low_rank: int = 3,
         v_init_scale: float = 0.01,
+        use_antithetic: bool = False,
+        use_stl: bool = False,
     ):
         self.model = model
         self.D = D
@@ -32,6 +36,8 @@ class DiagonalFisherVI:
         self.fisher_ema = fisher_ema
         self.variational_family = variational_family
         self.low_rank = low_rank
+        self.use_antithetic = use_antithetic
+        self.use_stl = use_stl
         if self.variational_family not in ("mean_field", "low_rank_diag"):
             raise ValueError("variational_family must be 'mean_field' or 'low_rank_diag'.")
 
@@ -56,18 +62,50 @@ class DiagonalFisherVI:
 
     def _sample_and_logq(self, mu, scale_param, V=None, n_samples=None):
         n = self.n_samples if n_samples is None else n_samples
+        use_pairs = self.use_antithetic and n >= 2
+        n_pair = n // 2 if use_pairs else 0
         if self.variational_family == "mean_field":
             sigma = torch.exp(scale_param)
-            eps = torch.randn(n, self.D)
+            if use_pairs:
+                eps_half = torch.randn(n_pair, self.D)
+                eps = torch.cat([eps_half, -eps_half], dim=0)
+                if n % 2 == 1:
+                    eps = torch.cat([eps, torch.randn(1, self.D)], dim=0)
+                eps = eps[:n]
+            else:
+                eps = torch.randn(n, self.D)
             z = mu + sigma * eps
-            log_q = (
-                -0.5 * (eps ** 2).sum(-1)
-                - scale_param.sum()
-                - 0.5 * self.D * torch.log(torch.tensor(2 * torch.pi))
-            )
+            if self.use_stl:
+                z_q = z.detach()
+                log_two_pi_half = -0.5 * self.D * math.log(2 * math.pi)
+                log_q = (
+                    -0.5 * (((z_q - mu) / sigma) ** 2).sum(-1)
+                    - scale_param.sum()
+                    + log_two_pi_half
+                )
+            else:
+                log_q = (
+                    -0.5 * (eps**2).sum(-1)
+                    - scale_param.sum()
+                    - 0.5 * self.D * torch.log(torch.tensor(2 * torch.pi))
+                )
             return z, log_q
-        z = lrd_reparameterize(mu, scale_param, V, n)
-        log_q = lrd_log_prob(z, mu, scale_param, V)
+        if use_pairs:
+            eps1_h = torch.randn(n_pair, self.D)
+            eps2_h = torch.randn(n_pair, self.low_rank)
+            eps1 = torch.cat([eps1_h, -eps1_h], dim=0)
+            eps2 = torch.cat([eps2_h, -eps2_h], dim=0)
+            if n % 2 == 1:
+                eps1 = torch.cat([eps1, torch.randn(1, self.D)], dim=0)
+                eps2 = torch.cat([eps2, torch.randn(1, self.low_rank)], dim=0)
+            eps1 = eps1[:n]
+            eps2 = eps2[:n]
+            s = torch.exp(scale_param)
+            z = mu + s * eps1 + eps2 @ V.T
+        else:
+            z = lrd_reparameterize(mu, scale_param, V, n)
+        z_q = z.detach() if self.use_stl else z
+        log_q = lrd_log_prob(z_q, mu, scale_param, V)
         return z, log_q
 
     def _flatten(self, mu, scale, V=None):
@@ -94,7 +132,7 @@ class DiagonalFisherVI:
             else:
                 scale = self.log_s.clone().requires_grad_(True)
                 V = self.V.clone().requires_grad_(True)
-            z, log_q = self._sample_and_logq(mu, scale, V, 1)
+            z, log_q = self._sample_and_logq(mu, scale, V, self.n_samples)
             elbo = (self.model.log_prob(z) - log_q).mean()
             elbo.backward()
             if self.variational_family == "mean_field":
@@ -111,7 +149,15 @@ class DiagonalFisherVI:
             a = self.fisher_ema
             self._fisher_ema = a * self._fisher_ema + (1 - a) * raw
 
+    def _closed_form_fisher_mean_field(self) -> torch.Tensor:
+        sigma_sq = torch.exp(2 * self.log_sigma)
+        f_mu = 1.0 / sigma_sq
+        f_ls = torch.full((self.D,), 2.0)
+        return torch.cat([f_mu, f_ls]) + self.damping
+
     def get_fisher_diagonal(self) -> torch.Tensor:
+        if self.variational_family == "mean_field":
+            return self._closed_form_fisher_mean_field()
         return self._fisher_ema + self.damping
 
     def condition_number(self) -> float:
@@ -136,7 +182,8 @@ class DiagonalFisherVI:
         return elbo.item(), grad
 
     def step(self) -> float:
-        self._empirical_fisher_step()
+        if self.variational_family == "low_rank_diag":
+            self._empirical_fisher_step()
         elbo_val, grad = self._elbo_and_grad()
         f = self.get_fisher_diagonal()
         self._apply_step(grad / f)
@@ -205,5 +252,5 @@ class DiagonalFisherVI:
             else:
                 g = self._flatten(mu.grad.detach(), scale.grad.detach(), V.grad.detach())
             per.append(g / f)
-        return torch.stack(per).var(dim=0).norm().item()
+        return torch.stack(per).var(dim=0, unbiased=False).norm().item()
 
